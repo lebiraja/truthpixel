@@ -1,0 +1,139 @@
+# AuthentiScan/TruthPixel Configuration File
+
+# Data Configuration
+data:
+  base_dir: "data"
+  downloads_dir: "data/downloads"
+  img_size: 224
+  batch_size: 16  # Reduced for 6GB VRAM (RTX 4050)
+  num_workers: 4
+
+# Datasets (NEW: 3 datasets - GenImage, CIFAKE, Faces)
+datasets:
+  training:
+    genimage:
+      enabled: true
+      weight: 0.44  # 400K images, 44%
+      max_size_gb: 8
+      num_images: 400000
+      generators: ['sd_v1.4', 'sd_v1.5', 'midjourney', 'glide', 'adm', 'vqdm', 'biggan', 'wukong']
+
+    cifake:
+      enabled: true
+      weight: 0.18  # 120K images, 18%
+      max_size_gb: 3
+      num_images: 120000
+      generator: 'stable_diffusion_v1.4'
+
+    faces:
+      enabled: true
+      weight: 0.38  # 140K images, 38%
+      max_size_gb: 7
+      num_images: 140000
+      generator: 'stylegan'
+
+# Model Configuration
+model:
+  architecture: "efficientnet_b0"
+  pretrained: true
+  dropout: 0.5
+  num_classes: 1
+
+# Training Configuration - NEW 4-PHASE APPROACH
+training:
+  device: "cuda"  # or "cpu"
+
+  # Phase 1: Baseline Models (one per dataset)
+  phase1_baseline:
+    enabled: true
+    epochs: 20
+    learning_rate: 0.0001
+    optimizer: "adam"
+    freeze_backbone: true
+    models:
+      - name: "genimage_baseline"
+        dataset: "genimage"
+      - name: "cifake_baseline"
+        dataset: "cifake"
+      - name: "faces_baseline"
+        dataset: "faces"
+
+  # Phase 2: Combined Model (all datasets)
+  phase2_combined:
+    enabled: true
+    epochs: 25
+    learning_rate: 0.0001
+    optimizer: "adam"
+    freeze_backbone: true  # Unfreeze after epoch 5
+    unfreeze_after_epoch: 5
+    unfreeze_layer_count: 20  # Last 20 layers
+    early_stopping_patience: 7
+    reduce_lr_patience: 3
+
+  # Phase 3: Cross-Dataset Validation
+  phase3_cross_validation:
+    enabled: true
+    test_combinations:
+      - train: "genimage"
+        test: ["cifake", "faces"]
+      - train: "cifake"
+        test: ["genimage", "faces"]
+      - train: "faces"
+        test: ["genimage", "cifake"]
+
+  # Phase 4: Grad-CAM Explainability
+  phase4_gradcam:
+    enabled: true
+    target_layer: "last_conv"
+    num_samples: 20
+    save_visualizations: true
+
+  # Common settings
+  weight_decay: 0.0001
+  gradient_clip_max_norm: 1.0
+
+# Hardware Configuration
+hardware:
+  gpu: "RTX 4050 Laptop"
+  vram_gb: 6
+  mixed_precision: true  # Enable FP16
+
+# Callbacks
+callbacks:
+  tensorboard: true
+  model_checkpoint:
+    save_best_only: false  # Save checkpoints every 5 epochs
+    save_freq: 5  # Save every 5 epochs
+    save_best: true  # Also save best model separately
+    monitor: "val_loss"
+  early_stopping:
+    monitor: "val_loss"
+    patience: 7
+  reduce_lr:
+    monitor: "val_loss"
+    patience: 3
+    factor: 0.5
+
+# Evaluation Metrics
+metrics:
+  - "accuracy"
+  - "precision"
+  - "recall"
+  - "f1"
+  - "auc"
+  - "confusion_matrix"
+  - "per_dataset_breakdown"
+
+# Paths
+paths:
+  models: "models"
+  logs: "results/logs"
+  results: "results"
+  checkpoints: "models/checkpoints"
+
+# Logging
+logging:
+  tensorboard: true
+  tensorboard_dir: "results/logs"
+  save_frequency: 5  # Save checkpoint every 5 epochs
+  log_frequency: 10  # Log metrics every N batches
