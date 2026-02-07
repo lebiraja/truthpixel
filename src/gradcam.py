@@ -1,413 +1,261 @@
 """
-Grad-CAM (Gradient-weighted Class Activation Mapping) Module for TruthPixel.
+Grad-CAM Explainability Script - Phase 4
 
-This module implements Grad-CAM for visual explanation of model predictions,
-showing which parts of the image influenced the classification decision.
+Generates Grad-CAM visualizations for model interpretability.
+
+Usage:
+    python src/gradcam.py --model all --samples 20
+    python src/gradcam.py --model genimage --samples 10
 """
 
-import os
-import sys
 import argparse
+import sys
+from pathlib import Path
+import yaml
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import tensorflow as tf
 import cv2
-from typing import Tuple, Optional, List
-import logging
 
-# Add src directory to path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import torch
+from torchvision import transforms
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image
+from pytorch_grad_cam.utils.model_targets import BinaryClassifierOutputTarget
 
-from data_loader_efficient import EfficientCIFAKEDataLoader as CIFAKEDataLoader
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from data_loader_multi import MultiDatasetLoader
+from train_baseline import DeepfakeDetector
 
 
-class GradCAM:
-    """
-    Grad-CAM implementation for visual explanations.
+class GradCAMVisualizer:
+    """Grad-CAM visualization for deepfake detection."""
 
-    Generates heatmaps showing which regions of an image
-    influenced the model's prediction.
-    """
-
-    def __init__(
-        self,
-        model: tf.keras.Model,
-        last_conv_layer_name: Optional[str] = None,
-        class_names: List[str] = ['Real', 'AI-Generated']
-    ):
+    def __init__(self, model, target_layer, device):
         """
         Initialize Grad-CAM.
 
         Args:
-            model: Trained Keras model
-            last_conv_layer_name: Name of last convolutional layer
-            class_names: Names of the classes
+            model: Trained model
+            target_layer: Layer to compute gradients (e.g., model.backbone.blocks[-1])
+            device: torch device
         """
         self.model = model
-        self.class_names = class_names
+        self.device = device
 
-        # Find last convolutional layer if not specified
-        if last_conv_layer_name is None:
-            last_conv_layer_name = self._find_last_conv_layer()
+        # Use last convolutional block
+        self.cam = GradCAM(
+            model=model,
+            target_layers=[target_layer],
+            use_cuda=(device.type == 'cuda')
+        )
 
-        self.last_conv_layer_name = last_conv_layer_name
-        logger.info(f"Using convolutional layer: {last_conv_layer_name}")
-
-    def _find_last_conv_layer(self) -> str:
+    def generate_heatmap(self, input_tensor, target_class=1):
         """
-        Find the last convolutional layer in the model.
-
-        Returns:
-            Name of the last convolutional layer
-        """
-        # For EfficientNetB0, the last conv layer is typically 'top_conv'
-        # or within the base model
-
-        # Try to find EfficientNet base model
-        for layer in self.model.layers:
-            if isinstance(layer, tf.keras.Model) and 'efficientnet' in layer.name.lower():
-                # Look for last conv layer in base model
-                for base_layer in reversed(layer.layers):
-                    if isinstance(base_layer, tf.keras.layers.Conv2D):
-                        return base_layer.name
-
-        # Fallback: search entire model
-        for layer in reversed(self.model.layers):
-            if isinstance(layer, tf.keras.layers.Conv2D):
-                return layer.name
-
-        raise ValueError("Could not find convolutional layer in model")
-
-    def get_gradcam_heatmap(
-        self,
-        img_array: np.ndarray,
-        pred_index: Optional[int] = None
-    ) -> np.ndarray:
-        """
-        Generate Grad-CAM heatmap for an image.
+        Generate Grad-CAM heatmap.
 
         Args:
-            img_array: Preprocessed image array (1, H, W, 3)
-            pred_index: Class index to generate heatmap for (None = predicted class)
+            input_tensor: Input image tensor (1, 3, H, W)
+            target_class: Target class (1 for fake, 0 for real)
 
         Returns:
             Heatmap as numpy array
         """
-        # Create a model that maps the input to the activations of the last conv layer
-        # and the output predictions
-        grad_model = tf.keras.models.Model(
-            [self.model.inputs],
-            [self.model.get_layer(self.last_conv_layer_name).output, self.model.output]
-        )
+        targets = [BinaryClassifierOutputTarget(target_class)]
 
-        # Compute the gradient of the top predicted class for the input image
-        # with respect to the activations of the last conv layer
-        with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(img_array)
+        # Generate CAM
+        grayscale_cam = self.cam(input_tensor=input_tensor, targets=targets)
 
-            if pred_index is None:
-                pred_index = tf.argmax(predictions[0])
+        # Get first image from batch
+        grayscale_cam = grayscale_cam[0, :]
 
-            # For binary classification with sigmoid, we use the raw output
-            class_channel = predictions[:, 0]
+        return grayscale_cam
 
-        # Compute gradients
-        grads = tape.gradient(class_channel, conv_outputs)
-
-        # Compute the guided gradients
-        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-
-        # Weight the channels by the corresponding gradients
-        conv_outputs = conv_outputs[0]
-        heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
-        heatmap = tf.squeeze(heatmap)
-
-        # Apply ReLU to the heatmap (only positive influences)
-        heatmap = tf.maximum(heatmap, 0)
-
-        # Normalize the heatmap
-        heatmap /= tf.reduce_max(heatmap) + 1e-10
-
-        return heatmap.numpy()
-
-    def overlay_heatmap_on_image(
-        self,
-        img: np.ndarray,
-        heatmap: np.ndarray,
-        alpha: float = 0.4,
-        colormap: int = cv2.COLORMAP_JET
-    ) -> np.ndarray:
+    def visualize(self, image_path, save_path=None):
         """
-        Overlay Grad-CAM heatmap on original image.
+        Create Grad-CAM visualization for an image.
 
         Args:
-            img: Original image (H, W, 3) in [0, 1] range
-            heatmap: Grad-CAM heatmap
-            alpha: Transparency of heatmap overlay
-            colormap: OpenCV colormap to use
-
-        Returns:
-            Image with heatmap overlay
-        """
-        # Resize heatmap to match image size
-        heatmap = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
-
-        # Convert heatmap to RGB
-        heatmap = np.uint8(255 * heatmap)
-        heatmap = cv2.applyColorMap(heatmap, colormap)
-        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-        heatmap = heatmap.astype(np.float32) / 255.0
-
-        # Convert image to [0, 255] range if needed
-        if img.max() <= 1.0:
-            img = img.copy()
-        else:
-            img = img.astype(np.float32) / 255.0
-
-        # Overlay heatmap on image
-        overlayed = heatmap * alpha + img * (1 - alpha)
-        overlayed = np.clip(overlayed, 0, 1)
-
-        return overlayed
-
-    def generate_visualization(
-        self,
-        img_array: np.ndarray,
-        original_img: np.ndarray,
-        save_path: Optional[str] = None
-    ) -> Tuple[np.ndarray, np.ndarray, str, float]:
-        """
-        Generate complete Grad-CAM visualization.
-
-        Args:
-            img_array: Preprocessed image for model (1, 224, 224, 3)
-            original_img: Original image for visualization
+            image_path: Path to input image
             save_path: Path to save visualization
 
         Returns:
-            Tuple of (heatmap, overlayed_image, prediction_label, confidence)
+            Visualization as numpy array
         """
-        # Get prediction
-        predictions = self.model.predict(img_array, verbose=0)
-        confidence = float(predictions[0][0])
+        # Load and preprocess image
+        from PIL import Image
 
-        # Determine predicted class
-        pred_class = 1 if confidence > 0.5 else 0
-        pred_label = self.class_names[pred_class]
+        img = Image.open(image_path).convert('RGB')
+        img = img.resize((224, 224))
+
+        # To tensor
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+
+        input_tensor = transform(img).unsqueeze(0).to(self.device)
+
+        # Get prediction
+        self.model.eval()
+        with torch.no_grad():
+            output = self.model(input_tensor)
+            prediction = output.item()
+            predicted_class = int(prediction > 0.5)
 
         # Generate heatmap
-        heatmap = self.get_gradcam_heatmap(img_array)
+        grayscale_cam = self.generate_heatmap(input_tensor, predicted_class)
 
-        # Overlay on original image
-        overlayed = self.overlay_heatmap_on_image(original_img, heatmap)
+        # Convert image to RGB array
+        rgb_img = np.array(img).astype(np.float32) / 255.0
 
-        # Save visualization if path provided
-        if save_path:
-            self.save_visualization(
-                original_img,
-                heatmap,
-                overlayed,
-                pred_label,
-                confidence,
-                save_path
-            )
+        # Overlay heatmap
+        visualization = show_cam_on_image(rgb_img, grayscale_cam, use_rgb=True)
 
-        return heatmap, overlayed, pred_label, confidence
-
-    def save_visualization(
-        self,
-        original_img: np.ndarray,
-        heatmap: np.ndarray,
-        overlayed: np.ndarray,
-        pred_label: str,
-        confidence: float,
-        save_path: str
-    ) -> None:
-        """
-        Save Grad-CAM visualization as image file.
-
-        Args:
-            original_img: Original image
-            heatmap: Grad-CAM heatmap
-            overlayed: Overlayed image
-            pred_label: Predicted label
-            confidence: Prediction confidence
-            save_path: Path to save the visualization
-        """
+        # Create figure
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-        # Original image
-        axes[0].imshow(original_img)
-        axes[0].set_title('Original Image', fontsize=12, fontweight='bold')
+        axes[0].imshow(img)
+        axes[0].set_title('Original Image', fontsize=12)
         axes[0].axis('off')
 
-        # Heatmap
-        axes[1].imshow(heatmap, cmap='jet')
-        axes[1].set_title('Grad-CAM Heatmap', fontsize=12, fontweight='bold')
+        axes[1].imshow(grayscale_cam, cmap='jet')
+        axes[1].set_title('Grad-CAM Heatmap', fontsize=12)
         axes[1].axis('off')
 
-        # Overlayed
-        axes[2].imshow(overlayed)
-
-        # Color-code title based on prediction
-        title_color = 'green' if pred_label == 'Real' else 'red'
-        axes[2].set_title(
-            f'Prediction: {pred_label}\nConfidence: {confidence:.2%}',
-            fontsize=12,
-            fontweight='bold',
-            color=title_color
-        )
+        axes[2].imshow(visualization)
+        prediction_text = f"{'FAKE' if predicted_class == 1 else 'REAL'} ({prediction:.2%})"
+        axes[2].set_title(f'Overlay - Pred: {prediction_text}', fontsize=12)
         axes[2].axis('off')
 
         plt.tight_layout()
 
-        # Create directory if needed
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close()
+        else:
+            plt.show()
 
-        # Save with high DPI
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
+        return visualization
 
-        logger.info(f"✓ Saved Grad-CAM visualization to {save_path}")
 
-    def batch_generate_examples(
-        self,
-        test_dataset: tf.data.Dataset,
-        num_examples: int = 10,
-        output_dir: str = 'results/gradcam_visualizations/'
-    ) -> None:
-        """
-        Generate Grad-CAM visualizations for multiple test samples.
+def batch_generate_gradcam(model_name, dataset_name, config, num_samples=20):
+    """Generate Grad-CAM visualizations for multiple samples."""
+    print(f"\nGenerating Grad-CAM for {model_name} on {dataset_name}...")
 
-        Args:
-            test_dataset: Test dataset
-            num_examples: Number of examples to generate
-            output_dir: Directory to save visualizations
-        """
-        logger.info(f"Generating {num_examples} Grad-CAM examples...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        os.makedirs(output_dir, exist_ok=True)
+    # Load model
+    models_dir = Path(config['paths']['models'])
 
-        examples_generated = 0
-        sample_idx = 0
+    if model_name == 'combined':
+        model_path = models_dir / 'combined' / 'combined_model_best.pt'
+    else:
+        model_path = models_dir / 'baseline' / f'{model_name}_baseline_best.pt'
 
-        # Try to get diverse examples
-        correct_real = []
-        correct_ai = []
-        incorrect_real = []
-        incorrect_ai = []
+    if not model_path.exists():
+        print(f"Model not found: {model_path}")
+        return
 
-        for images, labels in test_dataset:
-            for i in range(images.shape[0]):
-                if examples_generated >= num_examples * 2:  # Get extra to filter
-                    break
+    model = DeepfakeDetector().to(device)
+    checkpoint = torch.load(model_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
 
-                img = images[i:i+1]
-                true_label = int(labels[i])
-                original_img = images[i].numpy()
+    # Get target layer (last conv block in EfficientNet)
+    target_layer = model.backbone.blocks[-1]
 
-                # Get prediction
-                predictions = self.model.predict(img, verbose=0)
-                confidence = float(predictions[0][0])
-                pred_class = 1 if confidence > 0.5 else 0
+    # Create visualizer
+    visualizer = GradCAMVisualizer(model, target_layer, device)
 
-                # Categorize
-                is_correct = (pred_class == true_label)
+    # Get sample images
+    dataset_path = Path(config['data']['base_dir']) / dataset_name / 'test'
 
-                if is_correct and true_label == 0 and len(correct_real) < 3:
-                    correct_real.append((img, original_img, true_label, sample_idx))
-                elif is_correct and true_label == 1 and len(correct_ai) < 3:
-                    correct_ai.append((img, original_img, true_label, sample_idx))
-                elif not is_correct and true_label == 0 and len(incorrect_real) < 2:
-                    incorrect_real.append((img, original_img, true_label, sample_idx))
-                elif not is_correct and true_label == 1 and len(incorrect_ai) < 2:
-                    incorrect_ai.append((img, original_img, true_label, sample_idx))
+    fake_images = list((dataset_path / 'FAKE').glob('*.jpg'))[:num_samples//2]
+    real_images = list((dataset_path / 'REAL').glob('*.jpg'))[:num_samples//2]
 
-                sample_idx += 1
-                examples_generated += 1
+    if not fake_images:
+        fake_images = list((dataset_path / 'FAKE').glob('*.png'))[:num_samples//2]
+    if not real_images:
+        real_images = list((dataset_path / 'REAL').glob('*.png'))[:num_samples//2]
 
-            if examples_generated >= num_examples * 2:
-                break
+    all_images = fake_images + real_images
 
-        # Combine diverse examples
-        all_examples = (
-            correct_real[:3] +
-            correct_ai[:3] +
-            incorrect_real[:2] +
-            incorrect_ai[:2]
-        )
+    # Create output directory
+    output_dir = Path(config['paths']['results']) / 'gradcam' / model_name / dataset_name
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Generate visualizations
-        for idx, (img, original_img, true_label, sample_idx) in enumerate(all_examples[:num_examples]):
-            save_path = os.path.join(
-                output_dir,
-                f'gradcam_example_{idx+1}_true_{self.class_names[true_label]}.png'
-            )
+    # Generate visualizations
+    for idx, img_path in enumerate(all_images):
+        save_path = output_dir / f'gradcam_{idx:03d}_{img_path.stem}.png'
 
-            self.generate_visualization(img, original_img, save_path)
+        try:
+            visualizer.visualize(img_path, save_path)
+        except Exception as e:
+            print(f"  Failed on {img_path.name}: {e}")
 
-        logger.info(f"✓ Generated {min(len(all_examples), num_examples)} Grad-CAM examples")
+    print(f"  ✓ Saved {len(all_images)} visualizations to {output_dir}")
 
 
 def main():
-    """
-    Main function for Grad-CAM generation.
-    """
-    parser = argparse.ArgumentParser(description='Generate Grad-CAM Visualizations')
-
+    """Main function."""
+    parser = argparse.ArgumentParser(description="Generate Grad-CAM visualizations")
     parser.add_argument(
-        '--model_path',
+        '--model',
         type=str,
-        default='models/truthpixel_final.h5',
-        help='Path to trained model'
+        default='all',
+        choices=['genimage', 'cifake', 'faces', 'combined', 'all'],
+        help='Model to visualize'
     )
     parser.add_argument(
-        '--num_examples',
+        '--samples',
         type=int,
-        default=10,
-        help='Number of examples to generate'
+        default=20,
+        help='Number of samples per model/dataset'
     )
     parser.add_argument(
-        '--output_dir',
+        '--config',
         type=str,
-        default='results/gradcam_visualizations/',
-        help='Output directory for visualizations'
-    )
-    parser.add_argument(
-        '--batch_size',
-        type=int,
-        default=32,
-        help='Batch size'
+        default='config.yaml',
+        help='Path to config file'
     )
 
     args = parser.parse_args()
 
-    # Load model
-    logger.info(f"Loading model from {args.model_path}")
-    model = tf.keras.models.load_model(args.model_path)
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
 
-    # Load test dataset
-    logger.info("Loading test dataset...")
-    data_loader = CIFAKEDataLoader(data_dir="data", batch_size=args.batch_size)
-    _, _, test_ds = data_loader.prepare_datasets(augment_train=False)
+    print("="*80)
+    print("GRAD-CAM GENERATION - PHASE 4")
+    print("="*80)
 
-    # Create Grad-CAM generator
-    gradcam = GradCAM(model=model)
+    datasets = ['genimage', 'cifake', 'faces']
 
-    # Generate examples
-    gradcam.batch_generate_examples(
-        test_dataset=test_ds,
-        num_examples=args.num_examples,
-        output_dir=args.output_dir
-    )
+    if args.model == 'all':
+        models = ['genimage', 'cifake', 'faces', 'combined']
+    else:
+        models = [args.model]
 
-    logger.info("\n✓ Grad-CAM generation completed successfully!")
-    logger.info(f"✓ Visualizations saved to: {args.output_dir}")
+    try:
+        for model_name in models:
+            for dataset_name in datasets:
+                batch_generate_gradcam(
+                    model_name,
+                    dataset_name,
+                    config,
+                    num_samples=args.samples
+                )
+
+        print("\n" + "="*80)
+        print("✓ Grad-CAM generation complete!")
+        print("="*80)
+        print(f"\nVisualizations saved to: results/gradcam/")
+        return 0
+
+    except Exception as e:
+        print(f"\n✗ Grad-CAM generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

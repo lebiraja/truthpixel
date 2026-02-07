@@ -1,385 +1,456 @@
 """
-Streamlit Web Application for TruthPixel AI-Generated Image Detection.
+AuthentiScan Web Interface
+==========================
 
-This app provides a user-friendly interface for:
-- Uploading images
-- Real-time prediction (Real vs AI-Generated)
-- Confidence score display
-- Grad-CAM visualization
+Streamlit application for AI-Generated Image Detection.
+Features:
+- Multi-model support (GenImage, CIFAKE, Faces, Combined)
+- Real-time prediction with confidence scores
+- Grad-CAM explainability visualization
+- Batch processing
+- Model comparison
+- Cross-validation results
+
+Usage:
+    streamlit run app/streamlit_app.py
 """
 
-import os
-import sys
-import numpy as np
 import streamlit as st
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import timm
+import numpy as np
 from PIL import Image
+import sys
+from pathlib import Path
+import yaml
+import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
 import cv2
 
-# Add parent directory to path for imports
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
+# Add src to path
+SRC_PATH = Path(__file__).parent.parent / 'src'
+sys.path.append(str(SRC_PATH))
 
-from gradcam import GradCAM
+from augmentation import get_validation_transforms
 
-
-# Page configuration
+# Page config
 st.set_page_config(
-    page_title="TruthPixel - AI Image Detection",
-    page_icon="🔍",
+    page_title="AuthentiScan - AI Image Detector",
+    page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-
-# Custom CSS for styling
+# Custom CSS
 st.markdown("""
-    <style>
+<style>
     .main-header {
-        font-size: 3rem;
-        font-weight: bold;
-        text-align: center;
+        font-size: 2.5rem;
         color: #1E88E5;
+        text-align: center;
         margin-bottom: 0.5rem;
     }
     .sub-header {
-        font-size: 1.2rem;
-        text-align: center;
+        font-size: 1.1rem;
         color: #666;
+        text-align: center;
         margin-bottom: 2rem;
     }
-    .prediction-real {
-        font-size: 2rem;
-        font-weight: bold;
-        color: #2ECC71;
-        text-align: center;
-        padding: 1rem;
+    .result-card {
+        padding: 1.5rem;
         border-radius: 10px;
-        background-color: #E8F8F5;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        margin-bottom: 1rem;
     }
-    .prediction-ai {
-        font-size: 2rem;
-        font-weight: bold;
-        color: #E74C3C;
-        text-align: center;
+    .real {
+        background-color: #E8F5E9;
+        border-left: 5px solid #4CAF50;
+    }
+    .fake {
+        background-color: #FFEBEE;
+        border-left: 5px solid #F44336;
+    }
+    .uncertain {
+        background-color: #FFF8E1;
+        border-left: 5px solid #FFC107;
+    }
+    .metric-card {
+        background-color: #F5F5F5;
         padding: 1rem;
-        border-radius: 10px;
-        background-color: #FADBD8;
-    }
-    .confidence-score {
-        font-size: 1.5rem;
+        border-radius: 8px;
         text-align: center;
-        margin-top: 1rem;
     }
-    .info-box {
-        padding: 1rem;
-        border-radius: 10px;
-        background-color: #F0F2F6;
-        margin: 1rem 0;
-    }
-    </style>
+</style>
 """, unsafe_allow_html=True)
 
 
+# ==============================================================================
+# Model Definition (Matching training scripts)
+# ==============================================================================
+class DeepfakeDetector(nn.Module):
+    """EfficientNetB0-based deepfake detector."""
+
+    def __init__(self, pretrained=False, dropout=0.5):
+        super(DeepfakeDetector, self).__init__()
+
+        self.backbone = timm.create_model(
+            'efficientnet_b0',
+            pretrained=pretrained,
+            num_classes=0,
+            global_pool=''
+        )
+
+        # Get feature dimension (1280 for EfficientNet-B0)
+        feature_dim = 1280
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.flatten = nn.Flatten()
+
+        self.classifier = nn.Sequential(
+            nn.Linear(feature_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.6),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        features = self.backbone(x)
+        features = self.pool(features)
+        features = self.flatten(features)
+        output = self.classifier(features)
+        return output
+
+
+# ==============================================================================
+# Helper Functions
+# ==============================================================================
 @st.cache_resource
-def load_model(model_path: str = '../models/truthpixel_final.h5'):
-    """
-    Load the trained model (cached for performance).
+def load_model(model_name, device):
+    """Load a specific model from checkpoint."""
+    model_path = None
+    base_path = Path("models")
 
-    Args:
-        model_path: Path to the trained model
-
-    Returns:
-        Loaded Keras model
-    """
-    try:
-        # Try relative path first
-        if os.path.exists(model_path):
-            model = tf.keras.models.load_model(model_path)
-        # Try absolute path
-        elif os.path.exists(os.path.join(os.path.dirname(__file__), model_path)):
-            model_path = os.path.join(os.path.dirname(__file__), model_path)
-            model = tf.keras.models.load_model(model_path)
-        # Try from root
-        else:
-            model_path = 'models/truthpixel_final.h5'
-            model = tf.keras.models.load_model(model_path)
-
-        return model
-    except Exception as e:
-        st.error(f"Error loading model: {e}")
-        st.info("Please ensure the model file exists at: models/truthpixel_final.h5")
-        return None
-
-
-def preprocess_image(image: Image.Image) -> np.ndarray:
-    """
-    Preprocess uploaded image for model input.
-
-    Args:
-        image: PIL Image
-
-    Returns:
-        Preprocessed image array
-    """
-    # Convert to RGB if needed
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
-
-    # Resize to model input size
-    image = image.resize((224, 224))
-
-    # Convert to array and normalize
-    img_array = np.array(image) / 255.0
-
-    # Add batch dimension
-    img_array = np.expand_dims(img_array, axis=0)
-
-    return img_array
-
-
-def predict_image(model, img_array: np.ndarray):
-    """
-    Generate prediction for an image.
-
-    Args:
-        model: Trained Keras model
-        img_array: Preprocessed image array
-
-    Returns:
-        Tuple of (prediction_label, confidence)
-    """
-    # Get prediction
-    prediction = model.predict(img_array, verbose=0)[0][0]
-
-    # Determine class
-    if prediction > 0.5:
-        label = "AI-Generated"
-        confidence = float(prediction)
+    if model_name == "Combined Model":
+        model_path = base_path / "combined" / "combined_model_best.pt"
     else:
-        label = "Real"
-        confidence = float(1 - prediction)
+        # Extract dataset name from "X Baseline"
+        dataset = model_name.split()[0].lower()
+        model_path = base_path / "baseline" / f"{dataset}_baseline_best.pt"
 
-    return label, confidence
+    if not model_path.exists():
+        # Try finding standard checkpoint if best doesn't exist
+        fallback_path = str(model_path).replace("_best.pt", ".pt")
+        if Path(fallback_path).exists():
+            model_path = Path(fallback_path)
+        else:
+            return None, f"Model file not found: {model_path}"
 
-
-def generate_gradcam(model, img_array: np.ndarray, original_img: np.ndarray):
-    """
-    Generate Grad-CAM heatmap for the image.
-
-    Args:
-        model: Trained model
-        img_array: Preprocessed image
-        original_img: Original image for overlay
-
-    Returns:
-        Overlayed image with heatmap
-    """
     try:
-        # Create Grad-CAM instance
-        gradcam = GradCAM(model=model)
+        model = DeepfakeDetector(pretrained=False)
+        checkpoint = torch.load(model_path, map_location=device)
 
-        # Generate heatmap
-        heatmap = gradcam.get_gradcam_heatmap(img_array)
+        # Handle state dict structure
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
 
-        # Overlay on original image
-        overlayed = gradcam.overlay_heatmap_on_image(original_img, heatmap)
-
-        return heatmap, overlayed
+        model.load_state_dict(state_dict)
+        model.to(device)
+        model.eval()
+        return model, None
     except Exception as e:
-        st.warning(f"Could not generate Grad-CAM: {e}")
-        return None, None
+        return None, str(e)
 
 
+def get_gradcam(model, input_tensor, device):
+    """Generate Grad-CAM heatmap."""
+    from pytorch_grad_cam import GradCAM
+    from pytorch_grad_cam.utils.model_targets import BinaryClassifierOutputTarget
+
+    target_layer = model.backbone.blocks[-1]
+    cam = GradCAM(model=model, target_layers=[target_layer], use_cuda=(device.type == 'cuda'))
+
+    # Target: 1 for Fake, 0 for Real. We want to see what triggers the prediction.
+    # Get prediction first
+    with torch.no_grad():
+        output = model(input_tensor)
+        pred = output.item()
+        target_class = 1 if pred > 0.5 else 0
+
+    targets = [BinaryClassifierOutputTarget(target_class)]
+    grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
+    return grayscale_cam[0, :]
+
+
+def predict(model, image, device):
+    """Run prediction on a single image."""
+    # Preprocess
+    transform = get_validation_transforms(img_size=224)
+    img_tensor = transform(image).unsqueeze(0).to(device)
+
+    # Predict
+    model.eval()
+    with torch.no_grad():
+        output = model(img_tensor)
+        prob = output.item()
+
+    return prob, img_tensor
+
+
+# ==============================================================================
+# Main App
+# ==============================================================================
 def main():
-    """
-    Main Streamlit application.
-    """
     # Header
-    st.markdown('<div class="main-header">🔍 TruthPixel</div>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🛡️ AuthentiScan</h1>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="sub-header">AI-Generated Image Detection with Deep Learning</div>',
+        '<p class="sub-header">Advanced AI-Generated Image Detection System</p>',
         unsafe_allow_html=True
     )
 
     # Sidebar
-    with st.sidebar:
-        st.header("📊 About")
-        st.info(
-            """
-            **TruthPixel** uses a deep learning model based on EfficientNetB0
-            to detect whether an image is real or AI-generated.
+    st.sidebar.title("Configuration")
 
-            The model was trained on the CIFAKE dataset containing 120,000 images.
-            """
-        )
-
-        st.header("📈 Model Performance")
-        st.metric("Accuracy", ">92%")
-        st.metric("F1-Score", ">0.92")
-        st.metric("Dataset", "CIFAKE (120K images)")
-
-        st.header("🔬 Features")
-        st.markdown("""
-        - Real-time image classification
-        - Confidence score display
-        - Grad-CAM explainability
-        - Support for JPG, JPEG, PNG
-        """)
-
-        st.header("ℹ️ How to Use")
-        st.markdown("""
-        1. Upload an image using the file uploader
-        2. Click "Analyze Image"
-        3. View the prediction and confidence
-        4. Explore the Grad-CAM heatmap
-        """)
-
-    # Main content
-    st.markdown("---")
-
-    # Load model
-    model = load_model()
-
-    if model is None:
-        st.error("Failed to load model. Please check the model file path.")
-        return
-
-    st.success("✓ Model loaded successfully!")
-
-    # File uploader
-    st.header("📤 Upload Image")
-    uploaded_file = st.file_uploader(
-        "Choose an image file (JPG, JPEG, PNG)",
-        type=['jpg', 'jpeg', 'png'],
-        help="Upload an image to detect if it's real or AI-generated"
+    # Navigation
+    app_mode = st.sidebar.selectbox(
+        "Navigate",
+        ["Single Analysis", "Batch Processing", "Model Comparison", "Cross-Validation", "About"]
     )
 
-    if uploaded_file is not None:
-        # Display uploaded image
-        image = Image.open(uploaded_file)
+    # Hardware
+    device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_name)
+    st.sidebar.info(f"Running on: **{device_name.upper()}**")
 
-        col1, col2 = st.columns(2)
+    # Models
+    available_models = ["Combined Model", "GenImage Baseline", "CIFAKE Baseline", "Faces Baseline"]
 
-        with col1:
-            st.subheader("📷 Uploaded Image")
-            st.image(image, use_container_width=True)
+    # ==========================================================================
+    # Single Analysis Mode
+    # ==========================================================================
+    if app_mode == "Single Analysis":
+        st.header("🔍 Single Image Analysis")
 
-        # Analyze button
-        if st.button("🔍 Analyze Image", type="primary", use_container_width=True):
-            with st.spinner("Analyzing image..."):
-                # Preprocess image
-                img_array = preprocess_image(image)
-                original_img = np.array(image.resize((224, 224))) / 255.0
+        selected_model_name = st.sidebar.selectbox("Select Model", available_models)
 
-                # Get prediction
-                label, confidence = predict_image(model, img_array)
+        # Load model
+        with st.spinner(f"Loading {selected_model_name}..."):
+            model, error = load_model(selected_model_name, device)
 
-                # Display prediction
-                st.markdown("---")
-                st.header("📊 Prediction Results")
+        if error:
+            st.error(f"Failed to load model: {error}")
+            st.warning("Have you trained the models yet? Run `bash scripts/train_all.sh` first.")
+            return
 
-                if label == "Real":
-                    st.markdown(
-                        f'<div class="prediction-real">✓ {label} Image</div>',
-                        unsafe_allow_html=True
-                    )
-                else:
-                    st.markdown(
-                        f'<div class="prediction-ai">⚠ {label} Image</div>',
-                        unsafe_allow_html=True
-                    )
+        uploaded_file = st.file_uploader("Upload Image", type=['jpg', 'jpeg', 'png', 'webp'])
 
-                # Confidence score
-                st.markdown(
-                    f'<div class="confidence-score">Confidence: {confidence:.2%}</div>',
-                    unsafe_allow_html=True
-                )
+        if uploaded_file:
+            col1, col2 = st.columns([1, 1])
 
-                # Progress bar for confidence
-                st.progress(confidence)
+            # Display Image
+            image = Image.open(uploaded_file).convert('RGB')
+            with col1:
+                st.subheader("Input Image")
+                st.image(image, use_column_width=True)
 
-                # Grad-CAM visualization
-                st.markdown("---")
-                st.header("🔬 Grad-CAM Explainability")
+            # Prediction
+            with col2:
+                st.subheader("Analysis")
+                with st.spinner("Analyzing..."):
+                    prob, img_tensor = predict(model, image, device)
 
-                st.info(
-                    "The heatmap below shows which parts of the image influenced the model's decision. "
-                    "Red/yellow regions had the most impact on the prediction."
-                )
+                    # Grad-CAM
+                    try:
+                        heatmap = get_gradcam(model, img_tensor, device)
 
-                with st.spinner("Generating Grad-CAM visualization..."):
-                    heatmap, overlayed = generate_gradcam(model, img_array, original_img)
+                        # Overlay
+                        from pytorch_grad_cam.utils.image import show_cam_on_image
+                        img_np = np.array(image.resize((224, 224))) / 255.0
+                        vis = show_cam_on_image(img_np, heatmap, use_rgb=True)
 
-                    if heatmap is not None and overlayed is not None:
-                        col1, col2, col3 = st.columns(3)
+                        show_gradcam = st.checkbox("Show Explanation (Grad-CAM)", value=True)
+                        if show_gradcam:
+                            st.image(vis, caption="Model Attention Map", use_column_width=True)
 
-                        with col1:
-                            st.subheader("Original")
-                            st.image(original_img, use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"Could not generate Grad-CAM: {e}")
 
-                        with col2:
-                            st.subheader("Heatmap")
-                            fig, ax = plt.subplots()
-                            ax.imshow(heatmap, cmap='jet')
-                            ax.axis('off')
-                            st.pyplot(fig)
-                            plt.close()
+            # Results Display
+            is_fake = prob > 0.5
+            confidence = prob if is_fake else 1 - prob
+            label = "AI-Generated" if is_fake else "Real"
+            css_class = "fake" if is_fake else "real"
 
-                        with col3:
-                            st.subheader("Overlay")
-                            st.image(overlayed, use_container_width=True)
+            if 0.4 < prob < 0.6:
+                css_class = "uncertain"
+                label = "Uncertain"
+                st.warning("⚠️ Model is uncertain about this image.")
 
-                        st.success("✓ Analysis complete!")
-                    else:
-                        st.warning("Could not generate Grad-CAM visualization.")
-
-        # Additional information
-        with col2:
-            st.subheader("📝 Image Information")
             st.markdown(f"""
-            <div class="info-box">
-            <b>Filename:</b> {uploaded_file.name}<br>
-            <b>Size:</b> {image.size[0]} x {image.size[1]} pixels<br>
-            <b>Format:</b> {image.format}<br>
-            <b>Mode:</b> {image.mode}
+            <div class="result-card {css_class}">
+                <h2 style="margin:0; text-align:center;">{label}</h2>
+                <h3 style="margin:0; text-align:center;">Confidence: {confidence:.2%}</h3>
             </div>
             """, unsafe_allow_html=True)
 
-    else:
-        # Show example instructions
-        st.info("👆 Please upload an image to get started")
+            # Detailed Metrics
+            m1, m2 = st.columns(2)
+            m1.metric("Fake Probability", f"{prob:.2%}")
+            m2.metric("Real Probability", f"{1-prob:.2%}")
 
-        st.markdown("---")
-        st.header("📚 Example Use Cases")
+    # ==========================================================================
+    # Batch Processing Mode
+    # ==========================================================================
+    elif app_mode == "Batch Processing":
+        st.header("📂 Batch Processing")
 
-        col1, col2, col3 = st.columns(3)
+        selected_model_name = st.sidebar.selectbox("Select Model", available_models)
+        model, error = load_model(selected_model_name, device)
 
-        with col1:
-            st.markdown("### 🖼️ Verify Authenticity")
-            st.write("Check if an image is real or AI-generated for content moderation.")
+        if error:
+            st.error(error)
+            return
 
-        with col2:
-            st.markdown("### 🎨 Detect AI Art")
-            st.write("Identify AI-generated artwork in your digital collections.")
+        uploaded_files = st.file_uploader(
+            "Upload Images",
+            type=['jpg', 'jpeg', 'png', 'webp'],
+            accept_multiple_files=True
+        )
 
-        with col3:
-            st.markdown("### 📰 Combat Misinformation")
-            st.write("Verify images in news and social media to prevent fake content spread.")
+        if uploaded_files:
+            if st.button(f"Analyze {len(uploaded_files)} Images"):
+                results = []
+                progress_bar = st.progress(0)
 
-    # Footer
-    st.markdown("---")
-    st.markdown(
-        """
-        <div style="text-align: center; color: #666; padding: 2rem;">
-        <p>Built with ❤️ using TensorFlow, EfficientNetB0, and Streamlit</p>
-        <p>Trained on CIFAKE dataset | Model achieves >92% accuracy</p>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+                for idx, file in enumerate(uploaded_files):
+                    img = Image.open(file).convert('RGB')
+                    prob, _ = predict(model, img, device)
 
+                    results.append({
+                        "Filename": file.name,
+                        "Prediction": "AI-Generated" if prob > 0.5 else "Real",
+                        "Confidence": prob if prob > 0.5 else 1 - prob,
+                        "Fake_Prob": prob
+                    })
+                    progress_bar.progress((idx + 1) / len(uploaded_files))
+
+                df = pd.DataFrame(results)
+
+                # Summary
+                st.success("Analysis Complete!")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total Images", len(df))
+                c2.metric("Detected Fakes", len(df[df["Prediction"] == "AI-Generated"]))
+                c3.metric("Detected Real", len(df[df["Prediction"] == "Real"]))
+
+                # Table
+                st.dataframe(df.style.format({"Confidence": "{:.2%}", "Fake_Prob": "{:.2%}"}))
+
+                # Download
+                csv = df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    "Download CSV",
+                    csv,
+                    "authentiscan_results.csv",
+                    "text/csv",
+                    key='download-csv'
+                )
+
+    # ==========================================================================
+    # Model Comparison Mode
+    # ==========================================================================
+    elif app_mode == "Model Comparison":
+        st.header("⚖️ Model Comparison")
+        st.info("Compare predictions from all models on the same image.")
+
+        uploaded_file = st.file_uploader("Upload Image", type=['jpg', 'jpeg', 'png', 'webp'])
+
+        if uploaded_file:
+            image = Image.open(uploaded_file).convert('RGB')
+            st.image(image, width=300, caption="Input Image")
+
+            if st.button("Run All Models"):
+                cols = st.columns(len(available_models))
+
+                for idx, model_name in enumerate(available_models):
+                    with cols[idx]:
+                        st.markdown(f"**{model_name}**")
+                        model, error = load_model(model_name, device)
+
+                        if error:
+                            st.warning("Model not available")
+                            continue
+
+                        with st.spinner("Running..."):
+                            prob, img_tensor = predict(model, image, device)
+                            heatmap = get_gradcam(model, img_tensor, device)
+
+                            is_fake = prob > 0.5
+                            label = "FAKE" if is_fake else "REAL"
+                            color = "red" if is_fake else "green"
+
+                            st.markdown(f"<h3 style='color:{color}'>{label}</h3>", unsafe_allow_html=True)
+                            st.write(f"Conf: {prob if is_fake else 1-prob:.1%}")
+
+                            # Grad-CAM
+                            from pytorch_grad_cam.utils.image import show_cam_on_image
+                            img_np = np.array(image.resize((224, 224))) / 255.0
+                            vis = show_cam_on_image(img_np, heatmap, use_rgb=True)
+                            st.image(vis, caption="Attention")
+
+    # ==========================================================================
+    # Cross-Validation Results
+    # ==========================================================================
+    elif app_mode == "Cross-Validation":
+        st.header("🔄 Cross-Dataset Generalization")
+
+        # Load results if available
+        cv_path = Path("results/cross_validation/cross_validation_results.csv")
+        heatmap_path = Path("results/cross_validation/cross_validation_heatmap.png")
+
+        if heatmap_path.exists():
+            st.image(str(heatmap_path), caption="Generalization Matrix", use_column_width=True)
+
+        if cv_path.exists():
+            df = pd.read_csv(cv_path)
+            st.dataframe(df)
+        else:
+            st.info("No cross-validation results found. Run `python src/cross_validate.py` first.")
+
+        st.markdown("""
+        ### Understanding the Results
+        - **Diagonal**: Performance on training domain (expected to be high).
+        - **Off-Diagonal**: Performance on unseen domains (generalization).
+        - **Combined Model**: Should show consistent performance across all datasets.
+        """)
+
+    # ==========================================================================
+    # About
+    # ==========================================================================
+    elif app_mode == "About":
+        st.header("About AuthentiScan")
+        st.markdown("""
+        **AuthentiScan** is a production-grade AI detection system trained on 660K images.
+
+        ### Datasets
+        - **GenImage**: 400K images (8 generators: SD, Midjourney, etc.)
+        - **CIFAKE**: 120K images (Stable Diffusion)
+        - **Faces**: 140K images (StyleGAN)
+
+        ### Architecture
+        - **Backbone**: EfficientNet-B0
+        - **Training**: 4-Phase Progressive Strategy
+        - **Explainability**: Grad-CAM Integration
+
+        ### Team
+        Developed by the TruthPixel Team.
+        """)
 
 if __name__ == "__main__":
     main()
